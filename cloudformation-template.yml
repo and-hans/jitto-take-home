@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation stack for processing CSV files with AWS Lambda, DynamoDB, S3, and SNS.
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: jittotestbucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LambdaFunction.Arn
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Jitt-Music-Festival-Performances
+      AttributeDefinitions:
+        - AttributeName: Performer
+          AttributeType: S
+        - AttributeName: Date-Stage
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Performer
+          KeyType: HASH
+        - AttributeName: Date-Stage
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: JittoSNS
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DynamoDBTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::jittotestbucket/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:$ca-central-1:$794038212123:log-group:/aws/lambda/*"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: festival-lambda
+      Runtime: python3.10
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import os
+
+          # access AWS resources
+          dynamodb = boto3.resource('dynamodb')  # DynamoDB (table) service
+          sns = boto3.client('sns')  # SNS (notification) service
+          s3 = boto3.client('s3')  #  S3 (storage) service
+
+          # environment variables
+          TABLE_NAME: str = os.environ['DYNAMO_TABLE']
+          SNS_TOPIC: str = os.environ['SNS_TOPIC']
+
+          def lambda_handler(event, context) -> dict[str, str | int]:
+              # extract S3 bucket and file information
+              bucket_name: str = event['Records'][0]['s3']['bucket']['name']
+              file_key: str = event['Records'][0]['s3']['object']['key']
+              
+              try:
+                  # get csv file from bucket
+                  response = s3.get_object(Bucket=bucket_name, Key=file_key)
+                  csv_data = response['Body'].read().decode('utf-8').splitlines()
+
+                  # parse CSV and store in DynamoDB table
+                  table = dynamodb.Table(TABLE_NAME)  # get table
+                  reader = csv.DictReader(csv_data)  # read csv
+
+                  # add each performance to the DynamoDB table (row by row)
+                  for row in reader:
+                      table.put_item(Item={
+                          'Performer': row['Performer'],
+                          'Date-Stage': f"{row['Date']}-{row['Stage']}",
+                          'Start': row['Start'],
+                          'End': row['End']
+                      })
+
+                  # send success notification
+                  sns.publish(TopicArn=SNS_TOPIC, 
+                              Message='CSV file successfully uploaded and parsed', 
+                              Subject='Success')
+                  return {'statusCode': 200, 'body': 'CSV processed successfully'}
+
+              except Exception as e:
+                  # send failure notification with error message
+                  sns.publish(TopicArn=SNS_TOPIC, 
+                              Message=str(e), 
+                              Subject='Error')
+                  return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopic
+      Timeout: 10
+      MemorySize: 128
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: 794038212123
+      SourceArn: !Sub "arn:aws:s3:::jittotestbucket"
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/CSVProcessorFunction
+      RetentionInDays: 7
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket for CSV uploads.
+    Value: !Ref S3Bucket
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table.
+    Value: !Ref DynamoDBTable
+
+  SNSTopicARN:
+    Description: ARN of the SNS topic.
+    Value: !Ref SNSTopic
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function.
+    Value: !Ref LambdaFunction
